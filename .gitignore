@@ -1,0 +1,41 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Benchmark artifacts ---
+*.json
+!package.json
+benchmark_results*.json
+cpu.json
+cuda.json
+results*.json
+
+# --- Qdrant / docker local data ---
+qdrant_storage/
+docker/qdrant_storage/
+
+# --- Model / HF cache (nếu ai đó set HF_HOME vào repo) ---
+.cache/
+hf_cache/
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# --- Logs ---
+*.log
