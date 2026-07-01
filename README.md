@@ -175,6 +175,21 @@ python run_benchmark.py --embed-model BAAI/bge-m3 \
 | `--candidates` / `--top-k` | `20` / `5` | Y hệt `HYBRID_CANDIDATES` / `RETRIEVAL_TOP_K` |
 | `--output` | `benchmark_results.json` | File JSON kết quả |
 
+### Cấu hình bằng `.env` (thay cho gõ cờ mỗi lần)
+
+Mọi cờ đều có biến môi trường `BENCH_*` tương ứng. Chép mẫu rồi sửa:
+
+```bash
+cp .env.example .env      # sửa .env theo máy bạn
+python run_benchmark.py   # tự nạp .env, không cần --flag
+```
+
+Thứ tự ưu tiên: **cờ CLI > biến shell > `.env` > default trong code**. Ví dụ
+`.env` đặt `BENCH_DEVICE=cuda` nhưng chạy `--device cpu` thì CPU thắng. `.env`
+thật bị `.gitignore` bỏ qua (chỉ commit `.env.example`). Đổi file:
+`BENCH_ENV_FILE=prod.env python run_benchmark.py`. Xem `.env.example` để biết đủ
+biến (gồm cả `HF_HOME`, `HF_HUB_OFFLINE`, `CUDA_VISIBLE_DEVICES`).
+
 ---
 
 ## 4. Cơ chế đo lường — chi tiết

@@ -15,6 +15,11 @@ venv/
 env/
 ENV/
 
+# --- Local env config (giữ .env.example, bỏ .env thật) ---
+.env
+*.env
+!.env.example
+
 # --- Benchmark artifacts ---
 *.json
 !package.json

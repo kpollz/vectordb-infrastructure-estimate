@@ -34,11 +34,68 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
 import measurement as M
 from experiment_setup import ExperimentHarness
+
+
+# ---------------------------------------------------------------------------
+# Nạp .env (không cần thư viện ngoài) + helper đọc biến môi trường
+# ---------------------------------------------------------------------------
+
+def load_dotenv(path: str = ".env") -> None:
+    """Đọc file .env đơn giản (KEY=VALUE mỗi dòng) vào os.environ nếu chưa có.
+
+    KHÔNG ghi đè biến đã tồn tại trong môi trường → biến shell thật vẫn thắng .env.
+    Bỏ qua dòng trống và dòng bắt đầu bằng '#'. Không hỗ trợ nội suy/multiline.
+    """
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+
+
+def _env_str(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    return v if v not in (None, "") else default
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    try:
+        return int(v) if v not in (None, "") else default
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v in (None, ""):
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int_list(name: str, default: list) -> list:
+    """Đọc list số nguyên, phân tách bởi dấu phẩy hoặc khoảng trắng (vd '1,4,8,16')."""
+    v = os.environ.get(name)
+    if v in (None, ""):
+        return default
+    parts = v.replace(",", " ").split()
+    try:
+        return [int(x) for x in parts] or default
+    except ValueError:
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -197,31 +254,46 @@ def build_parser() -> argparse.ArgumentParser:
         description="RAG infra benchmark (Qdrant hybrid) — production chat-with-documents",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--qdrant-url", default="http://localhost:6333")
-    p.add_argument("--device", choices=["cpu", "cuda"], default="cpu",
+    # Mọi default đọc từ biến môi trường (xem .env.example) rồi mới tới hằng số.
+    # CLI luôn thắng env; env luôn thắng hằng số mặc định. Thứ tự ưu tiên:
+    #   CLI flag  >  biến môi trường (BENCH_*)  >  default trong code
+    p.add_argument("--qdrant-url", default=_env_str("BENCH_QDRANT_URL", "http://localhost:6333"))
+    p.add_argument("--device", choices=["cpu", "cuda"],
+                   default=_env_str("BENCH_DEVICE", "cpu"),
                    help="Chỉ ảnh hưởng embed+rerank (Qdrant/sparse luôn CPU)")
-    p.add_argument("--docs", type=int, default=10000, help="Số chunk khi KHÔNG scale-test")
-    p.add_argument("--chunk-tokens", type=int, default=DEFAULT_CHUNK_TOKENS)
-    p.add_argument("--queries", type=int, default=200, help="Số query đo tuần tự / pool")
-    p.add_argument("--concurrency", type=int, nargs="+", default=[1, 4, 8, 16])
-    p.add_argument("--batch-size", type=int, default=256, help="Batch encode khi ingest")
-    p.add_argument("--scale-test", action="store_true")
+    p.add_argument("--docs", type=int, default=_env_int("BENCH_DOCS", 10000),
+                   help="Số chunk khi KHÔNG scale-test")
+    p.add_argument("--chunk-tokens", type=int,
+                   default=_env_int("BENCH_CHUNK_TOKENS", DEFAULT_CHUNK_TOKENS))
+    p.add_argument("--queries", type=int, default=_env_int("BENCH_QUERIES", 200),
+                   help="Số query đo tuần tự / pool")
+    p.add_argument("--concurrency", type=int, nargs="+",
+                   default=_env_int_list("BENCH_CONCURRENCY", [1, 4, 8, 16]))
+    p.add_argument("--batch-size", type=int, default=_env_int("BENCH_BATCH_SIZE", 256),
+                   help="Batch encode khi ingest")
+    p.add_argument("--scale-test", action="store_true",
+                   default=_env_bool("BENCH_SCALE_TEST", False))
     p.add_argument("--scale-points", type=int, nargs="+",
-                   default=[1000, 5000, 10000, 50000, 100000])
-    p.add_argument("--quantization", choices=["none", "scalar", "binary"], default="none")
-    p.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
-    p.add_argument("--rerank-model", default=DEFAULT_RERANK_MODEL)
-    p.add_argument("--candidates", type=int, default=DEFAULT_CANDIDATES)
-    p.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
-    p.add_argument("--collection", default="bench_chunks")
-    p.add_argument("--hnsw-m", type=int, default=16)
-    p.add_argument("--hnsw-ef-construct", type=int, default=100)
-    p.add_argument("--output", default="benchmark_results.json")
-    p.add_argument("--seed", type=int, default=42)
+                   default=_env_int_list("BENCH_SCALE_POINTS", [1000, 5000, 10000, 50000, 100000]))
+    p.add_argument("--quantization", choices=["none", "scalar", "binary"],
+                   default=_env_str("BENCH_QUANTIZATION", "none"))
+    p.add_argument("--embed-model", default=_env_str("BENCH_EMBED_MODEL", DEFAULT_EMBED_MODEL))
+    p.add_argument("--rerank-model", default=_env_str("BENCH_RERANK_MODEL", DEFAULT_RERANK_MODEL))
+    p.add_argument("--candidates", type=int,
+                   default=_env_int("BENCH_CANDIDATES", DEFAULT_CANDIDATES))
+    p.add_argument("--top-k", type=int, default=_env_int("BENCH_TOP_K", DEFAULT_TOP_K))
+    p.add_argument("--collection", default=_env_str("BENCH_COLLECTION", "bench_chunks"))
+    p.add_argument("--hnsw-m", type=int, default=_env_int("BENCH_HNSW_M", 16))
+    p.add_argument("--hnsw-ef-construct", type=int,
+                   default=_env_int("BENCH_HNSW_EF_CONSTRUCT", 100))
+    p.add_argument("--output", default=_env_str("BENCH_OUTPUT", "benchmark_results.json"))
+    p.add_argument("--seed", type=int, default=_env_int("BENCH_SEED", 42))
     return p
 
 
 def main():
+    # Nạp .env TRƯỚC khi build parser để env trở thành default của argparse.
+    load_dotenv(os.environ.get("BENCH_ENV_FILE", ".env"))
     args = build_parser().parse_args()
 
     # cuda fallback
