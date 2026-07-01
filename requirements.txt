@@ -1,0 +1,30 @@
+# RAG Infrastructure Benchmark — dependencies
+# ============================================================================
+# Pin KHỚP với chat-with-documents/requirements.txt để benchmark đo đúng
+# phiên bản thư viện mà production dùng (hành vi encode/search có thể khác giữa
+# các version).
+#
+# CÀI:
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install --upgrade pip
+#   # GPU (CUDA 12.1 wheel — hợp với driver 535 / CUDA 12.2):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt
+#   # CPU-only thì bỏ dòng torch cu121 ở trên, pip sẽ kéo torch CPU từ PyPI.
+
+# --- Vector DB client (khớp chat-with-documents) ---
+qdrant-client==1.12.1
+
+# --- Embedding / rerank / sparse (khớp chat-with-documents) ---
+sentence-transformers==3.3.1
+scikit-learn==1.6.1
+
+# --- Deep learning runtime ---
+# Không pin bản +cuXXX ở đây để requirements dùng được cả CPU lẫn GPU.
+# Cài torch GPU TRƯỚC bằng --index-url cu121 (xem hướng dẫn trên), rồi mới
+# `pip install -r requirements.txt` — pip sẽ giữ nguyên torch GPU đã cài.
+torch>=2.2,<2.6
+
+# --- Đo lường / tiện ích ---
+numpy>=1.26,<2.2
+psutil>=5.9

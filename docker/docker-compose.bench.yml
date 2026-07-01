@@ -1,0 +1,33 @@
+# Qdrant server cho benchmark — ĐÚNG version production chat-with-documents.
+# Khớp deploy/docker-compose.yml của chat-with-documents (image v1.12.4, port 6333).
+#
+#   docker compose -f docker/docker-compose.bench.yml up -d qdrant
+#   python run_benchmark.py --qdrant-url http://localhost:6333 ...
+#   docker compose -f docker/docker-compose.bench.yml down          # dừng
+#   docker compose -f docker/docker-compose.bench.yml down -v       # + xóa data
+#
+# LƯU Ý: mặc định KHÔNG giới hạn cpu/mem để đo trần phần cứng workstation. Muốn
+# mô phỏng container bị bó tài nguyên (giống 1 node prod), bỏ comment khối
+# `deploy.resources.limits` bên dưới và chạy với `docker compose --compatibility`.
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: qdrant-bench
+    volumes:
+      - qdrantdata:/qdrant/storage
+    ports:
+      - "6333:6333"   # REST / gRPC-web
+      - "6334:6334"   # gRPC
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "4.0"
+    #       memory: 8g
+
+volumes:
+  qdrantdata:
