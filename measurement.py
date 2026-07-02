@@ -24,6 +24,7 @@ from __future__ import annotations
 import gc
 import queue
 import statistics
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -119,6 +120,70 @@ def _pct(sorted_ms: List[float], q: float) -> float:
     return float(np.percentile(sorted_ms, q)) if sorted_ms else 0.0
 
 
+def _fmt_dur(sec: float) -> str:
+    """Định dạng giây → '5s' / '2m30s' / '1h20m' cho dễ đọc."""
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
+class _Progress:
+    """In tiến độ tại chỗ (ghi đè cùng 1 dòng bằng '\\r') kèm ETA.
+
+    Chỉ in lại mỗi `min_interval` giây để không spam, cộng 1 lần cuối khi xong.
+    An toàn đa luồng (dùng cho cả đo song song): gọi update() trong lock hoặc để
+    tự khóa nội bộ.
+    """
+
+    def __init__(self, label: str, total: int, *, min_interval: float = 1.0,
+                 enabled: bool = True):
+        self.label = label
+        self.total = max(1, total)
+        self.min_interval = min_interval
+        self.enabled = enabled   # in cả khi pipe ra file (để theo dõi log chạy nền)
+        self._done = 0
+        self._t0 = time.perf_counter()
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    def tick(self, k: int = 1):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._done += k
+            now = time.perf_counter()
+            if now - self._last < self.min_interval and self._done < self.total:
+                return
+            self._last = now
+            self._render(now)
+
+    def _render(self, now: float):
+        done, total = self._done, self.total
+        elapsed = now - self._t0
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = (total - done) / rate if rate > 0 else 0.0
+        pct = 100.0 * done / total
+        bar_w = 24
+        filled = int(bar_w * done / total)
+        bar = "█" * filled + "·" * (bar_w - filled)
+        msg = (f"\r      {self.label:<28} [{bar}] {done}/{total} "
+               f"({pct:4.0f}%) {rate:6.1f}/s  elapsed {_fmt_dur(elapsed)} "
+               f"ETA {_fmt_dur(eta)}   ")
+        sys.stdout.write(msg)
+        sys.stdout.flush()
+
+    def close(self):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._render(time.perf_counter())
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
 def measure_latency(
     fn: Callable[[], object],
     n: int,
@@ -141,11 +206,14 @@ def measure_latency(
         torch.cuda.empty_cache()
     _reset_peak(device)
 
+    prog = _Progress(f"{component} (tuần tự)", n)
     lat: List[float] = []
     for _ in range(n):
         t0 = time.perf_counter()
         fn()
         lat.append((time.perf_counter() - t0) * 1000.0)
+        prog.tick()
+    prog.close()
 
     lat.sort()
     total_s = sum(lat) / 1000.0
@@ -196,6 +264,7 @@ def measure_concurrent(
     lat: List[float] = []
     errors = [0]
     lock = threading.Lock()
+    prog = _Progress(f"{component} (song song ×{concurrency})", total)
 
     def worker():
         local_lat = []
@@ -211,6 +280,7 @@ def measure_concurrent(
             except Exception:  # noqa: BLE001 — đếm lỗi để không im lặng nuốt
                 local_err += 1
             local_lat.append((time.perf_counter() - t0) * 1000.0)
+            prog.tick()
         with lock:
             lat.extend(local_lat)
             errors[0] += local_err
@@ -221,6 +291,7 @@ def measure_concurrent(
         for f in futs:
             f.result()
     wall_s = time.perf_counter() - t_wall0
+    prog.close()
 
     lat.sort()
     qps = total / wall_s if wall_s > 0 else 0.0

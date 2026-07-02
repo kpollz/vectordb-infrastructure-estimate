@@ -287,7 +287,8 @@ class ExperimentHarness:
             out.append((row.indices.tolist(), row.data.tolist()))
         return out
 
-    def ingest(self, docs: List[str], batch_size: int = 256, upsert_batch: int = 512) -> IngestStats:
+    def ingest(self, docs: List[str], batch_size: int = 256, upsert_batch: int = 512,
+               progress: bool = True) -> IngestStats:
         """Embed (normalize) + sparse-encode + upsert vào Qdrant. Đây là OFFLINE
         workload (khi approve tài liệu), đo tách khỏi query latency.
 
@@ -305,10 +306,13 @@ class ExperimentHarness:
         t0 = time.perf_counter()
 
         # --- embed (normalize_embeddings=True, y app/store/embeddings.py::encode) ---
+        # progress=True → sentence-transformers in progress bar tqdm cho khâu embed
+        # (chậm nhất của ingest). Có thể tắt bằng progress=False.
+        print(f"        → embed {len(docs):,} chunks (batch={batch_size}) ...", flush=True)
         t_e0 = time.perf_counter()
         vectors = self.embedder.encode(
             docs, batch_size=batch_size, normalize_embeddings=True,
-            convert_to_numpy=True, show_progress_bar=False,
+            convert_to_numpy=True, show_progress_bar=progress,
         )
         t_e1 = time.perf_counter()
 
@@ -317,8 +321,10 @@ class ExperimentHarness:
         t_s1 = time.perf_counter()
 
         # --- upsert theo batch (id = uuid4, y app/store/indexing.py) ---
+        print(f"        → upsert {len(docs):,} points vào Qdrant ...", flush=True)
         t_u0 = time.perf_counter()
         buf: List[PointStruct] = []
+        n_sent = 0
         for i, (vec, sp) in enumerate(zip(vectors, sparse_vecs)):
             idx, vals = sp
             buf.append(PointStruct(
@@ -328,9 +334,15 @@ class ExperimentHarness:
             ))
             if len(buf) >= upsert_batch:
                 self.client.upsert(collection_name=self.collection, points=buf, wait=True)
+                n_sent += len(buf)
                 buf = []
+                if progress:
+                    print(f"\r          upserted {n_sent:,}/{len(docs):,}", end="", flush=True)
         if buf:
             self.client.upsert(collection_name=self.collection, points=buf, wait=True)
+            n_sent += len(buf)
+        if progress:
+            print(f"\r          upserted {n_sent:,}/{len(docs):,}", flush=True)
         t_u1 = time.perf_counter()
 
         peak_vram = None

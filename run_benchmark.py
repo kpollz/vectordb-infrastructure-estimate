@@ -136,14 +136,23 @@ def run_one_scale(h: ExperimentHarness, n_chunks: int, args) -> dict:
     ]
     seq_samples = []
     conc_samples = []
-    for name, fn in runners:
-        print(f"  [measure] {name} ...")
+    # In trước KHỐI LƯỢNG công việc để không bị "đứng im không biết bao lâu".
+    n_conc = max(args.queries, max(args.concurrency) * 10)
+    calls_per_comp = args.queries + n_conc * len(args.concurrency)
+    print(f"\n  [measure] Sẽ đo {len(runners)} component. Mỗi component:")
+    print(f"            • tuần tự  : {args.queries} lần")
+    print(f"            • song song: {n_conc} lần × {len(args.concurrency)} mức "
+          f"{args.concurrency}  = {n_conc * len(args.concurrency)} lần")
+    print(f"            → {calls_per_comp} call/component. "
+          f"rerank & e2e mỗi call chấm {args.candidates} cặp (nặng nhất trên CPU).")
+    for ci, (name, fn) in enumerate(runners, 1):
+        print(f"\n  [measure {ci}/{len(runners)}] {name}")
         seq, conc = fn(
             h, queries,
             device=args.device,
             n_seq=args.queries,
             concurrency_levels=args.concurrency,
-            n_conc=max(args.queries, max(args.concurrency) * 10),
+            n_conc=n_conc,
         )
         seq_samples.append(seq)
         conc_samples.extend(conc)
