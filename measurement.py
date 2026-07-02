@@ -310,6 +310,129 @@ def measure_concurrent(
     )
 
 
+def measure_served(
+    produce: Callable[[int], object],
+    infer_batch: Callable[[List[object]], List[object]],
+    total: int,
+    concurrency: int,
+    *,
+    component: str,
+    placement: str,
+    max_batch: int = 32,
+    batch_wait_ms: float = 5.0,
+    warmup: int = 5,
+) -> ConcurrentSample:
+    """Mô phỏng **1 serving instance** phục vụ qua queue + dynamic batching — đúng
+    cách TEI / Triton / vLLM serve model trên GPU.
+
+    Khác hẳn `measure_concurrent` (C thread bắn thẳng vào model → tranh VRAM → OOM
+    giả tạo). Ở đây:
+
+        C client thread ──enqueue──▶  request queue  ──▶  1 inference worker
+                                                         (gom dynamic batch ≤ max_batch
+                                                          trong batch_wait_ms rồi gọi
+                                                          `infer_batch` MỘT lượt)
+
+    → không bao giờ để nhiều request tranh cấp phát VRAM cùng lúc (giống serving
+    server thật). `infer_batch(items)` phải xử lý cả list và trả list kết quả cùng
+    độ dài.
+
+    Đo:
+      - latency mỗi request = (enqueue → nhận kết quả) = queue_wait + inference.
+      - QPS = total / wall = throughput của MỘT instance serving.
+    """
+    # warmup: chạy vài request lẻ qua infer_batch để nạp kernel/cấp phát VRAM.
+    for i in range(min(warmup, total)):
+        try:
+            infer_batch([produce(i)])
+        except Exception:  # noqa: BLE001
+            pass
+
+    req_q: "queue.Queue" = queue.Queue()      # (item, event, result_box)
+    idx_q: "queue.Queue[int]" = queue.Queue()
+    for i in range(total):
+        idx_q.put(i)
+
+    lat: List[float] = []
+    lat_lock = threading.Lock()
+    errors = [0]
+    prog = _Progress(f"{component} (served ×{concurrency}, batch≤{max_batch})", total)
+
+    def client():
+        local_lat: List[float] = []
+        while True:
+            try:
+                i = idx_q.get_nowait()
+            except queue.Empty:
+                break
+            ev = threading.Event()
+            req_q.put((produce(i), ev))
+            t0 = time.perf_counter()
+            ev.wait()                       # chờ worker xử lý xong request này
+            local_lat.append((time.perf_counter() - t0) * 1000.0)
+            prog.tick()
+        with lat_lock:
+            lat.extend(local_lat)
+
+    def worker():
+        while True:
+            first = req_q.get()             # block chờ request (hoặc sentinel None)
+            if first is None:
+                break
+            batch = [first]
+            deadline = time.perf_counter() + batch_wait_ms / 1000.0
+            # gom thêm cho tới khi đủ max_batch hoặc hết thời gian chờ batch.
+            while len(batch) < max_batch:
+                rem = deadline - time.perf_counter()
+                if rem <= 0:
+                    break
+                try:
+                    it = req_q.get(timeout=rem)
+                except queue.Empty:
+                    break
+                if it is None:              # sentinel tới sớm — để lại cho blocking get
+                    req_q.put(None)
+                    break
+                batch.append(it)
+            items = [b[0] for b in batch]
+            try:
+                results = infer_batch(items)
+                for (_item, ev), _res in zip(batch, results):
+                    ev.set()
+            except Exception:  # noqa: BLE001
+                errors[0] += len(batch)
+                for _item, ev in batch:
+                    ev.set()
+
+    t_wall0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        c_futs = [ex.submit(client) for _ in range(concurrency)]
+        w = threading.Thread(target=worker, daemon=True)
+        w.start()
+        for f in c_futs:
+            f.result()                      # tất cả client đã enqueue xong + chờ xong
+        req_q.put(None)                     # báo worker dừng sau khi hết queue
+        w.join()
+    wall_s = time.perf_counter() - t_wall0
+    prog.close()
+
+    lat.sort()
+    qps = total / wall_s if wall_s > 0 else 0.0
+    return ConcurrentSample(
+        component=component,
+        placement=placement,
+        concurrency=concurrency,
+        total=total,
+        wall_s=wall_s,
+        qps=qps,
+        p50_ms=_pct(lat, 50),
+        p95_ms=_pct(lat, 95),
+        p99_ms=_pct(lat, 99),
+        avg_ms=statistics.mean(lat) if lat else 0.0,
+        errors=errors[0],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Component runners — nối ExperimentHarness thành pipeline production
 # ---------------------------------------------------------------------------
@@ -325,17 +448,38 @@ def _run_component(
     concurrency_levels: List[int],
     n_conc: int,
     warmup: int = 5,
+    served: bool = False,
+    produce: Optional[Callable[[int], object]] = None,
+    infer_batch: Optional[Callable[[List[object]], List[object]]] = None,
+    max_batch: int = 32,
+    batch_wait_ms: float = 5.0,
 ):
+    """Đo 1 component: latency tuần tự (luôn raw, 1 request/lần) + throughput.
+
+    Phần throughput chọn 1 trong 2 cơ chế:
+      - served=True  (GPU): queue + 1 inference worker + dynamic batching (measure_served)
+        → đúng cách serving server phục vụ, KHÔNG tranh VRAM → không OOM giả tạo.
+      - served=False (CPU / Qdrant-server / sparse): C thread song song thẳng
+        (measure_concurrent) — CPU thật sự song song theo core; Qdrant search đã có
+        queue riêng ở server nên raw là đúng.
+    """
     seq = measure_latency(
         lambda: call_i(_rand_idx()), n_seq,
         component=component, placement=placement, device=device, warmup=warmup,
     )
     conc: List[ConcurrentSample] = []
     for c in concurrency_levels:
-        conc.append(measure_concurrent(
-            call_i, n_conc, c,
-            component=component, placement=placement, warmup=warmup,
-        ))
+        if served and produce is not None and infer_batch is not None:
+            conc.append(measure_served(
+                produce, infer_batch, n_conc, c,
+                component=component, placement=placement,
+                max_batch=max_batch, batch_wait_ms=batch_wait_ms, warmup=warmup,
+            ))
+        else:
+            conc.append(measure_concurrent(
+                call_i, n_conc, c,
+                component=component, placement=placement, warmup=warmup,
+            ))
     return seq, conc
 
 
@@ -352,12 +496,50 @@ def _set_query_pool(n: int):
     _n_queries_global[0] = max(1, n)
 
 
-def bench_embed_query(h, queries, *, device, n_seq, concurrency_levels, n_conc):
+def _e2e_one(h, q):
+    """Chạy trọn pipeline production cho 1 query (dùng cho e2e sequential + served)."""
+    dv = h.encode_query_dense(q)
+    sv = h.encode_query_sparse(q)
+    hits = h.hybrid_search(dv, sv)
+    texts = [hit["content"] for hit in hits]
+    if texts:
+        scores = h.rerank(q, texts)
+        order = np.argsort(scores)[::-1][: h.top_k]
+        return [hits[j] for j in order]
+    return []
+
+
+def _rerank_batched(h, items):
+    """items = list của (query, list_doc_texts). Gộp toàn bộ (q,d) thành 1 lượt
+    predict (dynamic batching đúng nghĩa serving), rồi chia score lại từng request."""
+    flat = []
+    sizes = []
+    for q, docs in items:
+        for d in docs:
+            flat.append((q, d))
+        sizes.append(len(docs))
+    scores = h.reranker.predict(flat) if flat else []
+    out, k = [], 0
+    for s in sizes:
+        out.append(scores[k:k + s])
+        k += s
+    return out
+
+
+def bench_embed_query(h, queries, *, device, n_seq, concurrency_levels, n_conc,
+                      served=False, max_batch=32, batch_wait_ms=5.0):
     """Đo encode 1 query (dense) ONLINE — chi phí GPU/CPU thật mỗi truy vấn."""
     _set_query_pool(len(queries))
     call = lambda i: h.encode_query_dense(queries[i % len(queries)])
+    produce = lambda i: queries[i % len(queries)]
+    infer_batch = lambda items: h.embedder.encode(
+        items, batch_size=max(1, len(items)), normalize_embeddings=True,
+        convert_to_numpy=True, show_progress_bar=False,
+    )
     return _run_component(call, component="embed_query", placement=PLACEMENT["embed_query"],
-                          device=device, n_seq=n_seq, concurrency_levels=concurrency_levels, n_conc=n_conc)
+                          device=device, n_seq=n_seq, concurrency_levels=concurrency_levels,
+                          n_conc=n_conc, served=served, produce=produce, infer_batch=infer_batch,
+                          max_batch=max_batch, batch_wait_ms=batch_wait_ms)
 
 
 def bench_sparse_query(h, queries, *, device, n_seq, concurrency_levels, n_conc):
@@ -379,7 +561,8 @@ def bench_hybrid_search(h, queries, *, device, n_seq, concurrency_levels, n_conc
                           device="cpu", n_seq=n_seq, concurrency_levels=concurrency_levels, n_conc=n_conc)
 
 
-def bench_rerank(h, queries, *, device, n_seq, concurrency_levels, n_conc):
+def bench_rerank(h, queries, *, device, n_seq, concurrency_levels, n_conc,
+                 served=False, max_batch=32, batch_wait_ms=5.0):
     """Đo cross-encoder rerank `candidates` cặp (q, doc) THẬT lấy từ hybrid search
     (đúng phân phối đầu vào reranker gặp trong production)."""
     _set_query_pool(len(queries))
@@ -391,29 +574,30 @@ def bench_rerank(h, queries, *, device, n_seq, concurrency_levels, n_conc):
         hits = h.hybrid_search(dv, sv)
         cand_texts.append([hit["content"] for hit in hits] or [q])
     call = lambda i: h.rerank(queries[i % len(queries)], cand_texts[i % len(queries)])
+    produce = lambda i: (queries[i % len(queries)], cand_texts[i % len(queries)])
+    infer_batch = lambda items: _rerank_batched(h, items)
     return _run_component(call, component="rerank", placement=PLACEMENT["rerank"],
-                          device=device, n_seq=n_seq, concurrency_levels=concurrency_levels, n_conc=n_conc)
+                          device=device, n_seq=n_seq, concurrency_levels=concurrency_levels,
+                          n_conc=n_conc, served=served, produce=produce, infer_batch=infer_batch,
+                          max_batch=max_batch, batch_wait_ms=batch_wait_ms)
 
 
-def bench_e2e(h, queries, *, device, n_seq, concurrency_levels, n_conc):
+def bench_e2e(h, queries, *, device, n_seq, concurrency_levels, n_conc,
+              served=False, max_batch=32, batch_wait_ms=5.0):
     """Đo TOÀN pipeline 1 query như production: encode dense+sparse → hybrid RRF →
     rerank → top_k. Đây là latency người dùng thực sự cảm nhận."""
     _set_query_pool(len(queries))
-
-    def call(i):
-        q = queries[i % len(queries)]
-        dv = h.encode_query_dense(q)
-        sv = h.encode_query_sparse(q)
-        hits = h.hybrid_search(dv, sv)
-        texts = [hit["content"] for hit in hits]
-        if texts:
-            scores = h.rerank(q, texts)
-            order = np.argsort(scores)[::-1][: h.top_k]
-            return [hits[j] for j in order]
-        return []
-
+    call = lambda i: _e2e_one(h, queries[i % len(queries)])
+    produce = lambda i: queries[i % len(queries)]
+    # e2e qua queue + 1 worker (không gộp GPU跨 request vì pipeline pha search là IO);
+    # worker xử lý tuần tự → 1 inference 1 lúc → không tranh VRAM. max_batch chỉ giới
+    # hạn số request worker lấy mỗi lượt (vẫn chạy lần lượt trong infer_batch).
+    def infer_batch(items):
+        return [_e2e_one(h, q) for q in items]
     return _run_component(call, component="e2e", placement=PLACEMENT["e2e"],
-                          device=device, n_seq=n_seq, concurrency_levels=concurrency_levels, n_conc=n_conc)
+                          device=device, n_seq=n_seq, concurrency_levels=concurrency_levels,
+                          n_conc=n_conc, served=served, produce=produce, infer_batch=infer_batch,
+                          max_batch=max(1, min(max_batch, 4)), batch_wait_ms=batch_wait_ms)
 
 
 # ---------------------------------------------------------------------------

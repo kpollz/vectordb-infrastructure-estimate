@@ -79,6 +79,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    try:
+        return float(v) if v not in (None, "") else default
+    except ValueError:
+        return default
+
+
 def _env_bool(name: str, default: bool) -> bool:
     v = os.environ.get(name)
     if v in (None, ""):
@@ -139,21 +147,29 @@ def run_one_scale(h: ExperimentHarness, n_chunks: int, args) -> dict:
     # In trước KHỐI LƯỢNG công việc để không bị "đứng im không biết bao lâu".
     n_conc = max(args.queries, max(args.concurrency) * 10)
     calls_per_comp = args.queries + n_conc * len(args.concurrency)
+    # Cơ chế serving: embed/rerank/e2e (chạy model trong tiến trình) dùng "served"
+    # (queue + 1 worker + dynamic batching) khi GPU → không tranh VRAM → không OOM
+    # giả tạo. sparse/hybrid_search luôn raw (CPU / đã có queue ở Qdrant server).
+    served_gpu = (args.served == "on") or (args.served == "auto" and args.device == "cuda")
+    served_comps = {"embed_query", "rerank", "e2e"} if served_gpu else set()
     print(f"\n  [measure] Sẽ đo {len(runners)} component. Mỗi component:")
     print(f"            • tuần tự  : {args.queries} lần")
     print(f"            • song song: {n_conc} lần × {len(args.concurrency)} mức "
           f"{args.concurrency}  = {n_conc * len(args.concurrency)} lần")
     print(f"            → {calls_per_comp} call/component. "
-          f"rerank & e2e mỗi call chấm {args.candidates} cặp (nặng nhất trên CPU).")
+          f"rerank & e2e mỗi call chấm {args.candidates} cặp.")
+    if served_gpu:
+        print(f"            • GPU serving: {sorted(served_comps)} chạy qua queue + 1 worker "
+              f"+ dynamic batch≤{args.max_batch} (đúng cơ chế serving, không tranh VRAM).")
+    else:
+        print(f"            • GPU serving: TẮT (raw thread). Bật bằng --served on (hoặc auto trên cuda).")
     for ci, (name, fn) in enumerate(runners, 1):
         print(f"\n  [measure {ci}/{len(runners)}] {name}")
-        seq, conc = fn(
-            h, queries,
-            device=args.device,
-            n_seq=args.queries,
-            concurrency_levels=args.concurrency,
-            n_conc=n_conc,
-        )
+        kw = dict(device=args.device, n_seq=args.queries,
+                  concurrency_levels=args.concurrency, n_conc=n_conc)
+        if name in served_comps:
+            kw.update(served=True, max_batch=args.max_batch, batch_wait_ms=args.batch_wait_ms)
+        seq, conc = fn(h, queries, **kw)
         seq_samples.append(seq)
         conc_samples.extend(conc)
 
@@ -280,6 +296,15 @@ def build_parser() -> argparse.ArgumentParser:
                    default=_env_int_list("BENCH_CONCURRENCY", [1, 4, 8, 16]))
     p.add_argument("--batch-size", type=int, default=_env_int("BENCH_BATCH_SIZE", 256),
                    help="Batch encode khi ingest")
+    # --- Cơ chế serving cho GPU (sửa lỗi OOM giả tạo khi raw multi-thread bắn GPU) ---
+    p.add_argument("--served", choices=["auto", "on", "off"],
+                   default=_env_str("BENCH_SERVED", "auto"),
+                   help="on=luôn queue+1 worker+dynamic batch cho embed/rerank/e2e; "
+                        "off=raw thread; auto=on khi --device cuda, off khi cpu")
+    p.add_argument("--max-batch", type=int, default=_env_int("BENCH_MAX_BATCH", 32),
+                   help="Serving: số request tối đa gộp trong 1 lượt inference")
+    p.add_argument("--batch-wait-ms", type=float, default=_env_float("BENCH_BATCH_WAIT_MS", 5.0),
+                   help="Serving: thời gian chờ gom batch tối đa (ms) trước khi chạy inference")
     p.add_argument("--scale-test", action="store_true",
                    default=_env_bool("BENCH_SCALE_TEST", False))
     p.add_argument("--scale-points", type=int, nargs="+",

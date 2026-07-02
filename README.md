@@ -268,6 +268,29 @@ hiện hạ tầng**:
   > batch khi encode/predict. Benchmark này cố ý đo **đơn-query online** vì đó là
   > cái pipeline chat thực sự làm cho mỗi câu hỏi người dùng.
 
+#### 4.4.1 Chế độ "served" — sửa lỗi OOM giả tạo khi đo GPU
+
+Raw multi-thread bắn thẳng vào model khiến nhiều inference tranh cấp phát VRAM
+cùng lúc → `OutOfMemoryError` ở conc cao (đặc biệt card nhỏ 4–8 GB). Nhưng đó
+**không phải cách production phục vụ**: production chạy model trong **1 serving
+instance có queue + dynamic batching** (TEI / Triton / vLLM).
+
+Vì vậy, khi `--device cuda`, các component chạy model (`embed_query`, `rerank`,
+`e2e`) tự переключ sang chế độ **served**: `concurrency` client enqueue request
+vào 1 hàng đợi, **1 inference worker** gom dynamic batch (`--max-batch`, trong
+`--batch-wait-ms`) rồi gọi model **một lượt** → không bao giờ tranh VRAM.
+
+- Bật/tắt: `--served auto` (mặc định: on khi cuda, off khi cpu) / `on` / `off`.
+- `hybrid_search` và `sparse_query` luôn raw: Qdrant đã có queue riêng ở server,
+  CPU sparse thật sự song song theo core.
+- Kết quả: cột `errors` của embed/rerank/e2e trên GPU giờ **gần 0** thay vì nổ ở
+  conc 8/16; QPS phản ánh **throughput thật của 1 serving instance**.
+
+> Nếu bạn serve model bằng **TEI/Triton thật**, hãy benchmark bắn thẳng vào HTTP
+> của server đó (không qua chế độ served in-proc này) — đó là con số chính xác
+> nhất cho estimate hạ tầng. Chế độ served in-proc là mô phỏng gần đúng khi chưa
+  có serving server riêng.
+
 ### 4.5 Các runner nối pipeline (`bench_*`)
 
 Mỗi runner dựng một closure gọi **đúng một bước** pipeline production rồi giao cho
